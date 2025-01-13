@@ -1,114 +1,101 @@
-from rest_framework import viewsets, permissions, status
-from rest_framework.decorators import action
+from rest_framework.permissions import IsAuthenticated
+
+from rest_framework import viewsets, status
 from rest_framework.response import Response
-from django_filters.rest_framework import DjangoFilterBackend
-from rest_framework.pagination import PageNumberPagination
-from django.utils.timezone import now
-from django.contrib.auth import get_user_model
-
-from .models import Book, Transaction
-from .serializers import UserSerializer, BookSerializer, TransactionSerializer
-
-User = get_user_model()
-
-class CustomPagination(PageNumberPagination):
-    page_size = 10
-    page_size_query_param = 'page_size'
-    max_page_size = 100
-
-
-class UserViewSet(viewsets.ModelViewSet):
-    queryset = User.objects.all()
-    serializer_class = UserSerializer
-    permission_classes = [permissions.IsAuthenticated]
-    pagination_class = CustomPagination
-
-    def create(self, request, *args, **kwargs):
-        """Ensure no duplicate usernames or emails"""
-        try:
-            return super().create(request, *args, **kwargs)
-        except Exception as e:
-            return Response(
-                {"error": "Failed to create user. Ensure username and email are unique."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
+from rest_framework.decorators import action
+from .models import Book, User, Transaction
+from .serializers import BookSerializer, UserSerializer, TransactionSerializer
+from django.core.exceptions import ValidationError
 
 class BookViewSet(viewsets.ModelViewSet):
     queryset = Book.objects.all()
     serializer_class = BookSerializer
-    permission_classes = [permissions.IsAuthenticated]
-    filter_backends = [DjangoFilterBackend]
-    filterset_fields = ['title', 'author', 'isbn']
-    pagination_class = CustomPagination
+    permission_classes = [IsAuthenticated] 
+
+
+    # Custom action to handle checkout of a book
+    @action(detail=True, methods=['post'])
+    def checkout(self, request, pk=None):
+        book = self.get_object()
+
+        # Try to fetch the user from the request data
+        try:
+            user = User.objects.get(id=request.data['user_id'])
+        except User.DoesNotExist:
+            return Response({'detail': 'User not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        # Check if there are available copies of the book
+        if book.copies_available > 0:
+            # Decrease the available copies and create a transaction
+            try:
+                transaction = Transaction.objects.create(user=user, book=book)
+                book.copies_available -= 1
+                book.save()
+                return Response(TransactionSerializer(transaction).data, status=status.HTTP_201_CREATED)
+            except ValidationError as e:
+                return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        else:
+            return Response({'detail': 'No copies available'}, status=status.HTTP_400_BAD_REQUEST)
+
+    # Custom action to handle returning a book
+    @action(detail=True, methods=['post'])
+    def return_book(self, request, pk=None):
+        book = self.get_object()
+
+        # Try to find the active transaction for this book
+        try:
+            transaction = Transaction.objects.filter(book=book, return_date=None).first()
+        except Transaction.DoesNotExist:
+            return Response({'detail': 'Transaction not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        # Update the transaction's return date and increase available copies
+        if transaction:
+            try:
+                transaction.return_date = request.data.get('return_date', None)
+                transaction.save()
+
+                book.copies_available += 1
+                book.save()
+
+                return Response(TransactionSerializer(transaction).data, status=status.HTTP_200_OK)
+            except ValidationError as e:
+                return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        else:
+            return Response({'detail': 'No active transaction found'}, status=status.HTTP_404_NOT_FOUND)
+
+class UserViewSet(viewsets.ModelViewSet):
+    queryset = User.objects.all()
+    serializer_class = UserSerializer
+    permission_classes = [IsAuthenticated]
 
     def create(self, request, *args, **kwargs):
-        """Handle duplicate ISBN error gracefully"""
         try:
+            # Check if the user already exists before creating a new one
+            if User.objects.filter(email=request.data.get('email')).exists():
+                return Response({'detail': 'A user with this email already exists.'}, status=status.HTTP_400_BAD_REQUEST)
+
             return super().create(request, *args, **kwargs)
-        except Exception as e:
-            return Response(
-                {"error": "Failed to create book. ISBN must be unique."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-    @action(detail=False, methods=['get'], url_path='available')
-    def available_books(self, request):
-        """Get books with available copies"""
-        try:
-            available_books = Book.objects.filter(available_copies__gt=0)
-            page = self.paginate_queryset(available_books)
-            serializer = self.get_serializer(page, many=True)
-            return self.get_paginated_response(serializer.data)
-        except Exception as e:
-            return Response(
-                {"error": "Failed to fetch available books."},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
-
+        except ValidationError as e:
+            return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
 class TransactionViewSet(viewsets.ModelViewSet):
     queryset = Transaction.objects.all()
     serializer_class = TransactionSerializer
-    permission_classes = [permissions.IsAuthenticated]
 
-    @action(detail=False, methods=['post'], url_path='checkout')
-    def checkout(self, request):
-        """Checkout a book"""
-        user = request.user
-        book_id = request.data.get('book_id')
+    def create(self, request, *args, **kwargs):
         try:
-            book = Book.objects.get(id=book_id)
-            if book.available_copies > 0:
-                book.available_copies -= 1
-                book.save()
-                transaction = Transaction.objects.create(user=user, book=book)
-                return Response(TransactionSerializer(transaction).data, status=status.HTTP_201_CREATED)
-            return Response({"error": "No available copies."}, status=status.HTTP_400_BAD_REQUEST)
+            user = User.objects.get(id=request.data['user'])
+            book = Book.objects.get(id=request.data['book'])
+
+            # Check if there are available copies before allowing the transaction
+            if book.copies_available <= 0:
+                return Response({'detail': 'No available copies to check out.'}, status=status.HTTP_400_BAD_REQUEST)
+
+            return super().create(request, *args, **kwargs)
+        except User.DoesNotExist:
+            return Response({'detail': 'User not found'}, status=status.HTTP_404_NOT_FOUND)
         except Book.DoesNotExist:
-            return Response({"error": "Book not found."}, status=status.HTTP_404_NOT_FOUND)
-        except Exception as e:
-            return Response(
-                {"error": "Failed to checkout book."},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
+            return Response({'detail': 'Book not found'}, status=status.HTTP_404_NOT_FOUND)
+        except ValidationError as e:
+            return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
-    @action(detail=False, methods=['post'], url_path='return')
-    def return_book(self, request):
-        """Return a checked-out book"""
-        user = request.user
-        transaction_id = request.data.get('transaction_id')
-        try:
-            transaction = Transaction.objects.get(id=transaction_id, user=user, return_date__isnull=True)
-            transaction.return_date = now()
-            transaction.book.available_copies += 1
-            transaction.book.save()
-            transaction.save()
-            return Response(TransactionSerializer(transaction).data, status=status.HTTP_200_OK)
-        except Transaction.DoesNotExist:
-            return Response({"error": "Transaction not found or already returned."}, status=status.HTTP_404_NOT_FOUND)
-        except Exception as e:
-            return Response(
-                {"error": "Failed to return book."},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
